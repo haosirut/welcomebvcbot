@@ -1,11 +1,11 @@
 """
 Telegram Welcome Bot для BVC — БЕЗ внешних зависимостей.
-Webhook-режим для Amvera (polling не работает из-за блокировки исходящих long-polling).
+Webhook-режим для Amvera.
 
 Переменные окружения:
   BOT_TOKEN       — токен Telegram бота (от @BotFather)
   MANAGER_CHAT_ID — ID чата куда отправлять заявки (с минусом для групп)
-  WEBHOOK_URL     — публичный URL приложения в Amvera (напр. https://welcomebvcbot.amvera.io)
+  WEBHOOK_URL     — публичный URL приложения в Amvera (напр. https://welcomebvcbot-valeriinovikov.amvera.io)
   PORT            — порт (по умолчанию 8080)
 """
 
@@ -13,9 +13,11 @@ import os
 import json
 import ssl
 import logging
+import threading
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from datetime import datetime
 
 # -----------------------------------------------------------------------------
@@ -32,8 +34,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("welcomebvcbot")
 
+logger.info(f"BOT_TOKEN: {'set' if BOT_TOKEN else 'NOT SET'}")
+logger.info(f"MANAGER_CHAT_ID: {MANAGER_CHAT_ID or 'NOT SET'}")
+logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or 'NOT SET'}")
+logger.info(f"PORT: {PORT}")
+
 # -----------------------------------------------------------------------------
-# SSL context для исходящих запросов к Telegram API
+# SSL context
 # -----------------------------------------------------------------------------
 ssl_ctx = ssl.create_default_context()
 
@@ -44,7 +51,7 @@ API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 def tg_request(method, params=None):
-    """Вызов Telegram Bot API через urllib (короткие запросы, не long-polling)."""
+    """Вызов Telegram Bot API через urllib."""
     url = f"{API_BASE}/{method}"
     data = None
     if params:
@@ -59,7 +66,7 @@ def tg_request(method, params=None):
         with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             if not result.get("ok"):
-                logger.error(f"TG API error: {result}")
+                logger.error(f"TG API error ({method}): {result}")
             return result
     except Exception as e:
         logger.error(f"TG API request failed ({method}): {e}")
@@ -72,19 +79,6 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         params["reply_markup"] = reply_markup
     return tg_request("sendMessage", params)
-
-
-def edit_message_text(chat_id, message_id, text, reply_markup=None):
-    """Редактирование сообщения."""
-    params = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-    }
-    if reply_markup:
-        params["reply_markup"] = reply_markup
-    return tg_request("editMessageText", params)
 
 
 def answer_callback_query(callback_query_id, text=None):
@@ -136,12 +130,37 @@ STEP_PHONE = "phone"
 user_data = {}
 
 
+def get_user_step(chat_id):
+    """Получить текущий шаг пользователя."""
+    return user_data.get(chat_id, {}).get("step")
+
+
+def set_user_step(chat_id, step):
+    """Установить шаг пользователя."""
+    if chat_id not in user_data:
+        user_data[chat_id] = {}
+    user_data[chat_id]["step"] = step
+
+
+def save_user_info(chat_id, from_user):
+    """Сохранить информацию о пользователе Telegram."""
+    if chat_id not in user_data:
+        user_data[chat_id] = {}
+    user_data[chat_id]["user_info"] = {
+        "id": from_user.get("id"),
+        "username": from_user.get("username", ""),
+        "full_name": from_user.get("first_name", "")
+        + (" " + from_user.get("last_name", "") if from_user.get("last_name") else ""),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Message handlers
 # -----------------------------------------------------------------------------
 def handle_start(chat_id):
     """Приветствие + выбор типа тренировки."""
     user_data[chat_id] = {"step": STEP_TRAINING}
+    logger.info(f"User {chat_id} started registration")
 
     kb = inline_keyboard([
         [("Взрослые", "training_adult"), ("Детские", "training_kids")]
@@ -155,9 +174,9 @@ def handle_start(chat_id):
     )
 
 
-def handle_training_callback(chat_id, message_id, callback_data, callback_id):
+def handle_training_callback(chat_id, callback_data, callback_id):
     """Обработка выбора типа тренировки."""
-    if chat_id not in user_data or user_data[chat_id].get("step") != STEP_TRAINING:
+    if get_user_step(chat_id) != STEP_TRAINING:
         answer_callback_query(callback_id, "Начните заново: /start")
         return
 
@@ -167,12 +186,12 @@ def handle_training_callback(chat_id, message_id, callback_data, callback_id):
     }
     training_type = training_map.get(callback_data, "Неизвестно")
     user_data[chat_id]["training_type"] = training_type
-    user_data[chat_id]["step"] = STEP_BRANCH
+    set_user_step(chat_id, STEP_BRANCH)
+    logger.info(f"User {chat_id} chose training: {training_type}")
 
     kb = inline_keyboard([
         [("Песок", "branch_pesok"), ("Спот", "branch_spot")]
     ])
-    # Отправляем новое сообщение, не редактируем старое — история сохраняется
     send_message(
         chat_id,
         f"Вы выбрали: {training_type}\n\nВ каком филиале?",
@@ -181,9 +200,9 @@ def handle_training_callback(chat_id, message_id, callback_data, callback_id):
     answer_callback_query(callback_id)
 
 
-def handle_branch_callback(chat_id, message_id, callback_data, callback_id):
+def handle_branch_callback(chat_id, callback_data, callback_id):
     """Обработка выбора филиала."""
-    if chat_id not in user_data or user_data[chat_id].get("step") != STEP_BRANCH:
+    if get_user_step(chat_id) != STEP_BRANCH:
         answer_callback_query(callback_id, "Начните заново: /start")
         return
 
@@ -193,9 +212,9 @@ def handle_branch_callback(chat_id, message_id, callback_data, callback_id):
     }
     branch = branch_map.get(callback_data, "Неизвестно")
     user_data[chat_id]["branch"] = branch
-    user_data[chat_id]["step"] = STEP_NAME
+    set_user_step(chat_id, STEP_NAME)
+    logger.info(f"User {chat_id} chose branch: {branch}")
 
-    # Отправляем новое сообщение, не редактируем старое — история сохраняется
     send_message(
         chat_id,
         f"Филиал: {branch}\n\nКак вас зовут?",
@@ -205,7 +224,7 @@ def handle_branch_callback(chat_id, message_id, callback_data, callback_id):
 
 def handle_name_text(chat_id, text):
     """Обработка ввода имени."""
-    if chat_id not in user_data or user_data[chat_id].get("step") != STEP_NAME:
+    if get_user_step(chat_id) != STEP_NAME:
         return False
 
     name = text.strip()
@@ -214,7 +233,8 @@ def handle_name_text(chat_id, text):
         return True
 
     user_data[chat_id]["name"] = name
-    user_data[chat_id]["step"] = STEP_PHONE
+    set_user_step(chat_id, STEP_PHONE)
+    logger.info(f"User {chat_id} entered name: {name}")
 
     send_message(
         chat_id,
@@ -226,7 +246,7 @@ def handle_name_text(chat_id, text):
 
 def handle_phone_text(chat_id, text):
     """Обработка номера телефона введённого вручную."""
-    if chat_id not in user_data or user_data[chat_id].get("step") != STEP_PHONE:
+    if get_user_step(chat_id) != STEP_PHONE:
         return False
 
     phone = text.strip()
@@ -247,7 +267,7 @@ def handle_phone_text(chat_id, text):
 
 def handle_phone_contact(chat_id, phone):
     """Обработка номера телефона через кнопку «Поделиться»."""
-    if chat_id not in user_data or user_data[chat_id].get("step") != STEP_PHONE:
+    if get_user_step(chat_id) != STEP_PHONE:
         return False
 
     finish_registration(chat_id, phone)
@@ -299,9 +319,9 @@ def finish_registration(chat_id, phone):
     else:
         logger.warning("MANAGER_CHAT_ID not set, skipping manager notification")
 
-    # Помечаем шаг как завершённый, но не удаляем данные полностью
-    # чтобы подсказка о /start работала корректно
+    # Помечаем шаг как завершённый
     user_data[chat_id] = {"step": None}
+    logger.info(f"User {chat_id} completed registration")
 
 
 # -----------------------------------------------------------------------------
@@ -313,24 +333,17 @@ def process_update(update):
     if "callback_query" in update:
         cb = update["callback_query"]
         chat_id = cb["message"]["chat"]["id"]
-        message_id = cb["message"]["message_id"]
         callback_data = cb.get("data", "")
         callback_id = cb.get("id", "")
 
-        if chat_id not in user_data:
-            user_data[chat_id] = {}
-        from_user = cb.get("from", {})
-        user_data[chat_id]["user_info"] = {
-            "id": from_user.get("id"),
-            "username": from_user.get("username", ""),
-            "full_name": from_user.get("first_name", "")
-            + (" " + from_user.get("last_name", "") if from_user.get("last_name") else ""),
-        }
+        save_user_info(chat_id, cb.get("from", {}))
 
         if callback_data.startswith("training_"):
-            handle_training_callback(chat_id, message_id, callback_data, callback_id)
+            handle_training_callback(chat_id, callback_data, callback_id)
         elif callback_data.startswith("branch_"):
-            handle_branch_callback(chat_id, message_id, callback_data, callback_id)
+            handle_branch_callback(chat_id, callback_data, callback_id)
+        else:
+            answer_callback_query(callback_id, "Начните заново: /start")
         return
 
     # Обычное сообщение
@@ -340,37 +353,34 @@ def process_update(update):
     msg = update["message"]
     chat_id = msg["chat"]["id"]
 
-    if chat_id not in user_data:
-        user_data[chat_id] = {}
-    from_user = msg.get("from", {})
-    user_data[chat_id]["user_info"] = {
-        "id": from_user.get("id"),
-        "username": from_user.get("username", ""),
-        "full_name": from_user.get("first_name", "")
-        + (" " + from_user.get("last_name", "") if from_user.get("last_name") else ""),
-    }
+    save_user_info(chat_id, msg.get("from", {}))
 
     # Контакт (номер телефона через кнопку)
     if "contact" in msg:
         contact = msg["contact"]
         phone = contact.get("phone_number", "")
+        logger.info(f"User {chat_id} shared contact (phone)")
         handle_phone_contact(chat_id, phone)
         return
 
     text = msg.get("text", "")
 
-    if text.startswith("/start"):
+    # Команда /start
+    if text and text.startswith("/start"):
+        logger.info(f"User {chat_id} sent /start")
         handle_start(chat_id)
         return
 
+    # Шаг ввода имени
     if handle_name_text(chat_id, text):
         return
 
+    # Шаг ввода телефона
     if handle_phone_text(chat_id, text):
         return
 
     # Если пользователь не в процессе регистрации — подсказка
-    if chat_id not in user_data or user_data[chat_id].get("step") is None:
+    if get_user_step(chat_id) is None:
         send_message(
             chat_id,
             "Чтобы записаться на тренировку, нажмите /start",
@@ -378,13 +388,20 @@ def process_update(update):
 
 
 # -----------------------------------------------------------------------------
-# Webhook HTTP server
+# Multithreaded Webhook HTTP server
 # -----------------------------------------------------------------------------
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Многопоточный HTTP сервер для обработки webhook."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class WebhookHandler(BaseHTTPRequestHandler):
     """HTTP сервер: принимает webhook от Telegram + health check от Amvera."""
 
     def do_GET(self):
         """Health check для Amvera."""
+        logger.info(f"GET {self.path}")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
@@ -392,24 +409,34 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Получение обновлений от Telegram webhook."""
+        logger.info(f"POST {self.path}")
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
+        # Telegram отправляет webhook на любой путь — обрабатываем везде
         try:
             update = json.loads(body.decode("utf-8"))
-            logger.info(f"Received update: {json.dumps(update, ensure_ascii=False)[:200]}")
-            process_update(update)
-        except Exception as e:
-            logger.error(f"Error processing webhook update: {e}")
+            update_summary = json.dumps(update, ensure_ascii=False)[:300]
+            logger.info(f"Webhook update: {update_summary}")
 
-        # Telegram ожидает 200 OK
+            # Обрабатываем в отдельном потоке, чтобы быстро ответить 200
+            threading.Thread(
+                target=process_update,
+                args=(update,),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            logger.error(f"Error parsing webhook update: {e}")
+
+        # Telegram ожидает 200 OK — отвечаем быстро
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b'{"ok": true}')
 
     def log_message(self, format, *args):
-        logger.info(f"HTTP: {format % args}")
+        pass  # заглушаем стандартные логи HTTP, используем свои
 
 
 # -----------------------------------------------------------------------------
@@ -420,25 +447,41 @@ if __name__ == "__main__":
         logger.error("BOT_TOKEN environment variable is not set!")
         exit(1)
 
+    # Сначала удаляем старый вебхук
+    logger.info("Deleting old webhook...")
+    tg_request("deleteWebhook", {"drop_pending_updates": False})
+
     # Устанавливаем webhook
     if WEBHOOK_URL:
+        # Amvera маршрутизирует /webhook на порт 8080
         webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+        logger.info(f"Setting webhook to: {webhook_endpoint}")
+
         result = tg_request("setWebhook", {
             "url": webhook_endpoint,
-            "allowed_updates": json.dumps(["message", "callback_query"]),
+            "allowed_updates": ["message", "callback_query"],
         })
         if result and result.get("ok"):
-            logger.info(f"Webhook set to: {webhook_endpoint}")
+            logger.info(f"Webhook set successfully to: {webhook_endpoint}")
+            # Проверяем информацию о вебхуке
+            info = tg_request("getWebhookInfo")
+            if info and info.get("ok"):
+                wh_info = info.get("result", {})
+                logger.info(f"Webhook info: url={wh_info.get('url')}, "
+                           f"has_custom_cert={wh_info.get('has_custom_certificate')}, "
+                           f"pending_update_count={wh_info.get('pending_update_count')}, "
+                           f"last_error_date={wh_info.get('last_error_date')}, "
+                           f"last_error_message={wh_info.get('last_error_message')}")
         else:
             logger.error(f"Failed to set webhook: {result}")
     else:
-        logger.warning(
-            "WEBHOOK_URL not set! Bot will not receive updates via webhook. "
+        logger.error(
+            "WEBHOOK_URL not set! Bot will not receive updates. "
             "Set WEBHOOK_URL to your Amvera app public URL."
         )
 
-    # Запускаем HTTP сервер
-    server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
+    # Запускаем многопоточный HTTP сервер
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), WebhookHandler)
     logger.info(f"Webhook server started on 0.0.0.0:{PORT}")
     try:
         server.serve_forever()
