@@ -312,10 +312,14 @@ def finish_registration(chat_id, phone):
 
     if MANAGER_CHAT_ID:
         try:
-            send_message(int(MANAGER_CHAT_ID), manager_text)
-            logger.info(f"Registration info sent to manager chat {MANAGER_CHAT_ID}")
+            result = send_message(int(MANAGER_CHAT_ID), manager_text)
+            if result and result.get("ok"):
+                logger.info(f"SUCCESS: Registration info sent to manager chat {MANAGER_CHAT_ID}")
+            else:
+                logger.error(f"ERROR: Failed to send to manager chat {MANAGER_CHAT_ID}. "
+                           f"API response: {result}")
         except Exception as e:
-            logger.error(f"Failed to send message to manager chat: {e}")
+            logger.error(f"ERROR: Exception sending to manager chat {MANAGER_CHAT_ID}: {e}")
     else:
         logger.warning("MANAGER_CHAT_ID not set, skipping manager notification")
 
