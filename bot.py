@@ -172,9 +172,9 @@ def handle_training_callback(chat_id, message_id, callback_data, callback_id):
     kb = inline_keyboard([
         [("Песок", "branch_pesok"), ("Спот", "branch_spot")]
     ])
-    edit_message_text(
+    # Отправляем новое сообщение, не редактируем старое — история сохраняется
+    send_message(
         chat_id,
-        message_id,
         f"Вы выбрали: {training_type}\n\nВ каком филиале?",
         reply_markup=kb,
     )
@@ -195,9 +195,9 @@ def handle_branch_callback(chat_id, message_id, callback_data, callback_id):
     user_data[chat_id]["branch"] = branch
     user_data[chat_id]["step"] = STEP_NAME
 
-    edit_message_text(
+    # Отправляем новое сообщение, не редактируем старое — история сохраняется
+    send_message(
         chat_id,
-        message_id,
         f"Филиал: {branch}\n\nКак вас зовут?",
     )
     answer_callback_query(callback_id)
@@ -267,7 +267,8 @@ def finish_registration(chat_id, phone):
         chat_id,
         "✅ Вы успешно записались!\n\n"
         "С вами скоро свяжутся для подтверждения записи. "
-        "Спасибо за обращение!",
+        "Спасибо за обращение!\n\n"
+        "Если хотите записаться ещё раз — нажмите /start",
         reply_markup=reply_keyboard_remove(),
     )
 
@@ -298,7 +299,9 @@ def finish_registration(chat_id, phone):
     else:
         logger.warning("MANAGER_CHAT_ID not set, skipping manager notification")
 
-    user_data.pop(chat_id, None)
+    # Помечаем шаг как завершённый, но не удаляем данные полностью
+    # чтобы подсказка о /start работала корректно
+    user_data[chat_id] = {"step": None}
 
 
 # -----------------------------------------------------------------------------
@@ -365,6 +368,13 @@ def process_update(update):
 
     if handle_phone_text(chat_id, text):
         return
+
+    # Если пользователь не в процессе регистрации — подсказка
+    if chat_id not in user_data or user_data[chat_id].get("step") is None:
+        send_message(
+            chat_id,
+            "Чтобы записаться на тренировку, нажмите /start",
+        )
 
 
 # -----------------------------------------------------------------------------
