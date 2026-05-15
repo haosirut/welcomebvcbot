@@ -1,21 +1,20 @@
 """
 Telegram Welcome Bot для BVC — БЕЗ внешних зависимостей.
-Используется только Python стандартная библиотека (urllib, json, threading).
+Webhook-режим для Amvera (polling не работает из-за блокировки исходящих long-polling).
 
 Переменные окружения:
   BOT_TOKEN       — токен Telegram бота (от @BotFather)
   MANAGER_CHAT_ID — ID чата куда отправлять заявки (с минусом для групп)
-  PORT            — порт для health check (по умолчанию 8080)
+  WEBHOOK_URL     — публичный URL приложения в Amvera (напр. https://welcomebvcbot.amvera.io)
+  PORT            — порт (по умолчанию 8080)
 """
 
 import os
 import json
-import time
+import ssl
 import logging
-import threading
 import urllib.request
 import urllib.error
-import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
@@ -24,6 +23,7 @@ from datetime import datetime
 # -----------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MANAGER_CHAT_ID = os.getenv("MANAGER_CHAT_ID", "")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 PORT = int(os.getenv("PORT", "8080"))
 
 logging.basicConfig(
@@ -33,15 +33,18 @@ logging.basicConfig(
 logger = logging.getLogger("welcomebvcbot")
 
 # -----------------------------------------------------------------------------
+# SSL context для исходящих запросов к Telegram API
+# -----------------------------------------------------------------------------
+ssl_ctx = ssl.create_default_context()
+
+# -----------------------------------------------------------------------------
 # Telegram API helper (pure stdlib)
 # -----------------------------------------------------------------------------
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-LAST_UPDATE_ID = 0
-
 
 def tg_request(method, params=None):
-    """Вызов Telegram Bot API через urllib."""
+    """Вызов Telegram Bot API через urllib (короткие запросы, не long-polling)."""
     url = f"{API_BASE}/{method}"
     data = None
     if params:
@@ -53,7 +56,7 @@ def tg_request(method, params=None):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             if not result.get("ok"):
                 logger.error(f"TG API error: {result}")
@@ -64,7 +67,7 @@ def tg_request(method, params=None):
 
 
 def send_message(chat_id, text, reply_markup=None):
-    """Отправка сообщения пользователю."""
+    """Отправка сообщения."""
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         params["reply_markup"] = reply_markup
@@ -96,9 +99,7 @@ def answer_callback_query(callback_query_id, text=None):
 # Keyboard builders
 # -----------------------------------------------------------------------------
 def inline_keyboard(buttons):
-    """
-    buttons: list of list of (text, callback_data) tuples
-    """
+    """buttons: list of list of (text, callback_data) tuples"""
     kb = {
         "inline_keyboard": [
             [{"text": t, "callback_data": d} for t, d in row]
@@ -244,7 +245,7 @@ def handle_phone_text(chat_id, text):
     return True
 
 
-def handle_phone_contact(chat_id, phone, user_info):
+def handle_phone_contact(chat_id, phone):
     """Обработка номера телефона через кнопку «Поделиться»."""
     if chat_id not in user_data or user_data[chat_id].get("step") != STEP_PHONE:
         return False
@@ -259,7 +260,6 @@ def finish_registration(chat_id, phone):
     training_type = data.get("training_type", "Не указано")
     branch = data.get("branch", "Не указано")
     name = data.get("name", "Не указано")
-
     user_info = data.get("user_info", {})
 
     # Сообщение пользователю
@@ -306,12 +306,6 @@ def finish_registration(chat_id, phone):
 # -----------------------------------------------------------------------------
 def process_update(update):
     """Обработка одного обновления от Telegram."""
-    global LAST_UPDATE_ID
-
-    update_id = update.get("update_id", 0)
-    if update_id >= LAST_UPDATE_ID:
-        LAST_UPDATE_ID = update_id + 1
-
     # Callback query (нажатие на inline кнопку)
     if "callback_query" in update:
         cb = update["callback_query"]
@@ -320,7 +314,6 @@ def process_update(update):
         callback_data = cb.get("data", "")
         callback_id = cb.get("id", "")
 
-        # Сохраняем информацию о пользователе
         if chat_id not in user_data:
             user_data[chat_id] = {}
         from_user = cb.get("from", {})
@@ -335,7 +328,6 @@ def process_update(update):
             handle_training_callback(chat_id, message_id, callback_data, callback_id)
         elif callback_data.startswith("branch_"):
             handle_branch_callback(chat_id, message_id, callback_data, callback_id)
-
         return
 
     # Обычное сообщение
@@ -345,7 +337,6 @@ def process_update(update):
     msg = update["message"]
     chat_id = msg["chat"]["id"]
 
-    # Сохраняем информацию о пользователе
     if chat_id not in user_data:
         user_data[chat_id] = {}
     from_user = msg.get("from", {})
@@ -360,77 +351,55 @@ def process_update(update):
     if "contact" in msg:
         contact = msg["contact"]
         phone = contact.get("phone_number", "")
-        handle_phone_contact(chat_id, phone, user_data[chat_id].get("user_info", {}))
+        handle_phone_contact(chat_id, phone)
         return
 
     text = msg.get("text", "")
 
-    # Команда /start
     if text.startswith("/start"):
         handle_start(chat_id)
         return
 
-    # Шаг ввода имени
     if handle_name_text(chat_id, text):
         return
 
-    # Шаг ввода телефона
     if handle_phone_text(chat_id, text):
         return
 
 
 # -----------------------------------------------------------------------------
-# Polling loop
+# Webhook HTTP server
 # -----------------------------------------------------------------------------
-def polling_loop():
-    """Основной цикл polling."""
-    global LAST_UPDATE_ID
+class WebhookHandler(BaseHTTPRequestHandler):
+    """HTTP сервер: принимает webhook от Telegram + health check от Amvera."""
 
-    logger.info("Starting polling loop...")
-
-    # Удаляем вебхук
-    tg_request("deleteWebhook", {"drop_pending_updates": True})
-
-    while True:
-        try:
-            result = tg_request(
-                "getUpdates",
-                {
-                    "offset": LAST_UPDATE_ID,
-                    "timeout": 30,
-                    "allowed_updates": json.dumps(["message", "callback_query"]),
-                },
-            )
-            if result and result.get("ok"):
-                updates = result.get("result", [])
-                for update in updates:
-                    try:
-                        process_update(update)
-                    except Exception as e:
-                        logger.error(f"Error processing update: {e}")
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            time.sleep(3)
-
-
-# -----------------------------------------------------------------------------
-# Health check HTTP server (для Amvera)
-# -----------------------------------------------------------------------------
-class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        """Health check для Amvera."""
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
 
+    def do_POST(self):
+        """Получение обновлений от Telegram webhook."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+
+        try:
+            update = json.loads(body.decode("utf-8"))
+            logger.info(f"Received update: {json.dumps(update, ensure_ascii=False)[:200]}")
+            process_update(update)
+        except Exception as e:
+            logger.error(f"Error processing webhook update: {e}")
+
+        # Telegram ожидает 200 OK
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
     def log_message(self, format, *args):
-        pass  # заглушаем логи HTTP сервера
-
-
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info(f"Health check server started on 0.0.0.0:{PORT}")
-    server.serve_forever()
+        logger.info(f"HTTP: {format % args}")
 
 
 # -----------------------------------------------------------------------------
@@ -441,9 +410,28 @@ if __name__ == "__main__":
         logger.error("BOT_TOKEN environment variable is not set!")
         exit(1)
 
-    # Health check сервер в отдельном потоке
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
+    # Устанавливаем webhook
+    if WEBHOOK_URL:
+        webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+        result = tg_request("setWebhook", {
+            "url": webhook_endpoint,
+            "allowed_updates": json.dumps(["message", "callback_query"]),
+        })
+        if result and result.get("ok"):
+            logger.info(f"Webhook set to: {webhook_endpoint}")
+        else:
+            logger.error(f"Failed to set webhook: {result}")
+    else:
+        logger.warning(
+            "WEBHOOK_URL not set! Bot will not receive updates via webhook. "
+            "Set WEBHOOK_URL to your Amvera app public URL."
+        )
 
-    # Запуск polling бота
-    polling_loop()
+    # Запускаем HTTP сервер
+    server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
+    logger.info(f"Webhook server started on 0.0.0.0:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        server.shutdown()
